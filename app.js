@@ -2,7 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
-const APP_VER = 4;                // 画面の版。サーバーの MIN_CLIENT_VER と合わせる。上げたら index.html の ?v= も変える
+const APP_VER = 5;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -55,6 +55,8 @@ async function api(action, data) {
   } finally {
     clearTimeout(timer);
   }
+  // 通ったら再読み込みの印を消す（次に版が上がったときも自動で読み込み直せるように）
+  if (!j.stale) { try { sessionStorage.removeItem('koutei_reload'); } catch (e) {} }
   if (!j.ok) {
     // サーバーの方が新しい：最新の画面を読み込み直す（繰り返さないよう1回だけ）
     if (j.stale) {
@@ -80,6 +82,7 @@ function toast(msg) {
 }
 
 // ---------- 音 ----------
+// 登録は「チャリン」（コイン）、工程の完了は「チャリーン」（レジ）。警告・エラーは電子音
 let audioCtx = null;
 function tone(freq, start, dur) {
   const o = audioCtx.createOscillator(), g = audioCtx.createGain();
@@ -89,12 +92,50 @@ function tone(freq, start, dur) {
   o.start(audioCtx.currentTime + start);
   o.stop(audioCtx.currentTime + start + dur);
 }
+/** 鳴った直後から小さくなっていく音（金属・ベルの響き） */
+function ring(freq, start, dur, type, vol) {
+  const t = audioCtx.currentTime + start;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(t);
+  o.stop(t + dur + 0.02);
+}
+/** 「チャ」の部分：高い音だけを残した短いノイズ */
+function clink(start, dur, vol) {
+  const t = audioCtx.currentTime + start;
+  const len = Math.floor(audioCtx.sampleRate * dur);
+  const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  const src = audioCtx.createBufferSource(), hp = audioCtx.createBiquadFilter(), g = audioCtx.createGain();
+  src.buffer = buf;
+  hp.type = 'highpass';
+  hp.frequency.value = 4000;
+  g.gain.value = vol;
+  src.connect(hp); hp.connect(g); g.connect(audioCtx.destination);
+  src.start(t);
+}
 function sound(kind) {
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === 'suspended') audioCtx.resume();
-    if (kind === 'ok') tone(1500, 0, 0.1);
-    else if (kind === 'complete') { tone(1500, 0, 0.1); tone(2000, 0.15, 0.15); }
+    if (kind === 'ok') {
+      // チャリン：コインの2音
+      ring(1976, 0, 0.09, 'square', 0.08);
+      ring(2637, 0.08, 0.45, 'square', 0.08);
+    } else if (kind === 'complete') {
+      // チャリーン：レジの「チャ」＋ベルの響き
+      clink(0, 0.06, 0.35);
+      ring(2093, 0.03, 1.0, 'sine', 0.22);
+      ring(2637, 0.06, 1.0, 'sine', 0.16);
+      ring(3136, 0.09, 1.1, 'sine', 0.13);
+      ring(4186, 0.12, 0.8, 'sine', 0.08);
+    }
     else if (kind === 'warn') { tone(800, 0, 0.15); tone(800, 0.25, 0.15); tone(800, 0.5, 0.15); }
     else if (kind === 'ng') tone(300, 0, 0.6);
   } catch (e) {}
@@ -335,6 +376,7 @@ async function pump() {
   if (S.sending) return;
   S.sending = true;
   while (S.queue.length && S.token) {
+    const token = S.token;
     const item = S.queue[0];
     let res = null, error = null;
     for (let n = 0; n < RETRY; n++) {
@@ -347,19 +389,23 @@ async function pump() {
         await sleep(1500 * (n + 1));    // 同じ送信IDで再送するので、二重には数えない
       }
     }
-    if (!S.token) break; // 途中でログアウトした
+    // 途中でログアウトした（別の人がログインし直した場合も）。今の人の送信待ちには触らない
+    if (S.token !== token) break;
     S.queue.shift();
     if (res) reconcile(item, res);
     else fail(item, error);
     updatePending();
   }
   S.sending = false;
+  if (S.queue.length && S.token) pump(); // 入れ替わった人の送信待ちを続けて送る
 }
 
 /** サーバーの結果で確定させる。予測と違ったときだけ音と表示で知らせる */
 function reconcile(item, j) {
-  if (j.row) mergeRow(j.row, item.proc, j.count);
   const r = S.byPno.get(item.pno);
+  // 完了として記録されなかったときは、手元で先に付けた「仮の完了」を元に戻す
+  if (j.result !== 'ok' && r && item.snapshot) { r.done = item.snapshot.done; r.count = item.snapshot.count; }
+  if (j.row) mergeRow(j.row, item.proc, j.result === 'ok' ? j.count : null);
   if (r && j.counts) r.count = j.counts;
   const changed = j.result !== item.predicted;
   if (j.result === 'ok') {
