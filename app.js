@@ -2,6 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
+const APP_VER = 4;                // 画面の版。サーバーの MIN_CLIENT_VER と合わせる。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -43,7 +44,7 @@ async function api(action, data) {
     // Content-Type を付けない（text/plain）ことで、GASへのCORSプリフライトを避ける
     const res = await fetch(API_URL, {
       method: 'POST',
-      body: JSON.stringify(Object.assign({ action: action, token: S.token }, data || {})),
+      body: JSON.stringify(Object.assign({ action: action, token: S.token, ver: APP_VER }, data || {})),
       signal: ctrl.signal,
     });
     j = await res.json();
@@ -55,6 +56,12 @@ async function api(action, data) {
     clearTimeout(timer);
   }
   if (!j.ok) {
+    // サーバーの方が新しい：最新の画面を読み込み直す（繰り返さないよう1回だけ）
+    if (j.stale) {
+      let tried = false;
+      try { tried = sessionStorage.getItem('koutei_reload') === '1'; sessionStorage.setItem('koutei_reload', '1'); } catch (e) {}
+      if (!tried) location.reload();
+    }
     const err = new Error(j.error);
     err.auth = j.auth;
     if (j.auth) logout(j.error);
