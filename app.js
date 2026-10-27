@@ -2,7 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
-const APP_VER = 5;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
+const APP_VER = 6;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -156,11 +156,21 @@ function unpack(a) {
 function applyInit(j) {
   S.processes = j.processes; S.today = j.today; S.reasons = j.reasons || [];
   if (j.user) S.user = j.user;
-  S.rows = j.rows.map(unpack);
-  S.byPno = new Map(S.rows.map(r => [r.pno, r]));
+  setRows(j.rows, j.frpRows);
   // 再ログインをすぐ表示できるよう、一覧（製品データのみ）を端末に残す
-  lsSet('koutei_rows', { at: Date.now(), today: j.today, processes: j.processes, reasons: S.reasons, rows: j.rows });
+  lsSet('koutei_rows', { at: Date.now(), today: j.today, processes: j.processes, reasons: S.reasons, rows: j.rows, frpRows: j.frpRows });
 }
+
+// 一覧は2種類：マスター（水研〜完了）と、FRP実績の2Fシート（FRP）
+function setRows(rows, frpRows) {
+  S.rows = rows.map(unpack);
+  S.byPno = new Map(S.rows.map(r => [r.pno, r]));
+  S.frpRows = (frpRows || []).map(unpack);
+  S.frpByPno = new Map(S.frpRows.map(r => [r.pno, r]));
+}
+function isFrp(proc) { return proc === 'FRP'; }
+function rowsFor(proc) { return isFrp(proc) ? S.frpRows : S.rows; }
+function rowOf(proc, pno) { return (isFrp(proc) ? S.frpByPno : S.byPno).get(pno); }
 
 /** ログイン中の人が担当できる工程（暗証番号シートC列）。判定はサーバーでも行う */
 function allowedProcs() { return S.processes.filter(p => p.allowed !== false); }
@@ -290,9 +300,15 @@ function renderProcs() {
 $('procArea').addEventListener('click', e => {
   const b = e.target.closest('button[data-proc]');
   if (!b) return;
+  const cur = S.dates[S.dateIdx];
   S.proc = b.dataset.proc;
   S.last = null;
   touch();
+  // FRPとそれ以外では一覧の元が違うので、出荷日の並びを作り直す（同じ日付があればそのまま）
+  buildDates();
+  const i = S.dates.indexOf(cur);
+  if (i >= 0) S.dateIdx = i;
+  if (isFrp(S.proc)) setRecoatMode(false);
   renderProcs(); renderList();
   $('result').className = 'card';
   $('result').innerHTML = '<div class="muted">工程を「' + esc(procName(S.proc)) + '」に切り替えました。</div>';
@@ -327,7 +343,7 @@ function enqueue(pno, opts) {
 
 /** 手元のデータでの判定（サーバーの結果を待たずに表示する） */
 function predict(item) {
-  const r = S.byPno.get(item.pno);
+  const r = rowOf(item.proc, item.pno);
   item.entry = addRecent('sending', item.pno, item.proc, '送信中…');
   if (!r) {
     item.predicted = 'unknown';
@@ -351,8 +367,15 @@ function predict(item) {
 
 /** 予測した結果を手元の一覧に反映する */
 function predictApply(item) {
-  const r = S.byPno.get(item.pno);
+  const r = rowOf(item.proc, item.pno);
   if (!r || isDoneFor(r, item.proc)) return;
+  // FRPは1回読めば完了（数量は数えない）。前の工程が無いのでスキップも無い
+  if (isFrp(item.proc)) {
+    r.count = Object.assign({}, r.count, { FRP: r.qty });
+    r.done = Object.assign({}, r.done, { FRP: true });
+    item.skips = [];
+    return;
+  }
   const next = item.opts.all ? r.qty : Math.min(r.qty, countOf(r, item.proc) + 1);
   r.count = Object.assign({}, r.count, { [item.proc]: next });
   if (next >= r.qty && hasCol(item.proc)) r.done = Object.assign({}, r.done, { [item.proc]: true });
@@ -360,7 +383,7 @@ function predictApply(item) {
   // 飛ばされた前の工程はスキップ扱い（未着手の工程だけ。最終的な判定はサーバーが行う）
   const idx = S.processes.findIndex(p => p.code === item.proc);
   item.skips = S.processes.slice(0, idx)
-    .filter(p => p.code !== 'STOCK' && !isDoneFor(r, p.code) && countOf(r, p.code) === 0)
+    .filter(p => p.code !== 'STOCK' && !isFrp(p.code) && !isDoneFor(r, p.code) && countOf(r, p.code) === 0)
     .map(p => p.code);
   item.skips.forEach(code => {
     r.count = Object.assign({}, r.count, { [code]: r.qty });
@@ -402,7 +425,7 @@ async function pump() {
 
 /** サーバーの結果で確定させる。予測と違ったときだけ音と表示で知らせる */
 function reconcile(item, j) {
-  const r = S.byPno.get(item.pno);
+  const r = rowOf(item.proc, item.pno);
   // 完了として記録されなかったときは、手元で先に付けた「仮の完了」を元に戻す
   if (j.result !== 'ok' && r && item.snapshot) { r.done = item.snapshot.done; r.count = item.snapshot.count; }
   if (j.row) mergeRow(j.row, item.proc, j.result === 'ok' ? j.count : null);
@@ -420,6 +443,9 @@ function reconcile(item, j) {
   } else if (j.result === 'shipped') {
     sound('warn');
     setRecent(item.entry, 'warn', '出荷済み');
+  } else if (j.result === 'notfrp') {
+    sound('warn');
+    setRecent(item.entry, 'warn', 'FRPの一覧にない');
   } else {
     sound('ng');
     setRecent(item.entry, 'ng', 'マスターになし');
@@ -434,7 +460,7 @@ function reconcile(item, j) {
 
 function fail(item, e) {
   // 予測で変えた手元の状態を元に戻す
-  const r = S.byPno.get(item.pno);
+  const r = rowOf(item.proc, item.pno);
   if (r && item.snapshot) { r.done = item.snapshot.done; r.count = item.snapshot.count; }
   sound('ng');
   setRecent(item.entry, 'ng', '送信失敗：' + e.message);
@@ -446,7 +472,7 @@ function fail(item, e) {
 }
 
 function mergeRow(row, proc, count) {
-  const r = S.byPno.get(row.pno);
+  const r = rowOf(proc, row.pno);
   if (!r) return;
   r.done = row.done;
   if (count != null) r.count = Object.assign({}, r.count, { [proc]: count });
@@ -468,14 +494,19 @@ function showPendingCard(item) {
 function renderResult(j, item) {
   const el = $('result');
   const proc = esc(procName(item.proc));
-  if (j.result === 'shipped' || j.result === 'notfound') {
-    el.className = 'card ' + (j.result === 'shipped' ? 'warn' : 'ng');
-    el.innerHTML = '<div class="rhead">' + (j.result === 'shipped' ? '出荷済みです' : 'マスターに見つかりません') + '</div>' +
+  if (j.result === 'shipped' || j.result === 'notfound' || j.result === 'notfrp') {
+    const msg = {
+      shipped: ['出荷済みです', 'DONEシートにあります。'],
+      notfound: ['マスターに見つかりません', 'ラベルの読み間違いか、未登録のP.Noです。'],
+      notfrp: ['FRPの対象外です', 'FRP実績（2Fシート）にないP.Noです。工程の選び間違いに注意してください。'],
+    }[j.result];
+    el.className = 'card ' + (j.result === 'notfound' ? 'ng' : 'warn');
+    el.innerHTML = '<div class="rhead">' + msg[0] + '</div>' +
       '<div class="pno">' + esc(item.pno) + '</div>' +
-      '<div class="muted">' + (j.result === 'shipped' ? 'DONEシートにあります。' : 'ラベルの読み間違いか、未登録のP.Noです。') + '（警告として記録）</div>';
+      '<div class="muted">' + msg[1] + '（警告として記録）</div>';
     return;
   }
-  const r = S.byPno.get(item.pno) || j.row;
+  const r = rowOf(item.proc, item.pno) || j.row;
   let head, cls;
   if (j.result === 'already') { head = '⚠ ' + proc + 'は完了済みです'; cls = 'warn'; }
   else if (j.completed) { head = '✔ ' + proc + ' 完了'; cls = 'complete'; }
@@ -485,6 +516,9 @@ function renderResult(j, item) {
   const showAll = j.result === 'ok' && !j.completed && j.qty > 1;
   const canUndo = !j.pending && j.result === 'ok' && S.last && S.last.id === j.id;
   const skipped = j.result === 'ok' ? (j.skipped || []) : [];
+  // FRPの行は2Fシートから来ていて他の工程の状態を持たないので、工程の表示はマスターの行に重ねる
+  const master = isFrp(item.proc) ? S.byPno.get(item.pno) : null;
+  const stepDone = master ? Object.assign({}, master.done, { FRP: r.done.FRP }) : r.done;
   el.innerHTML =
     '<div class="rhead">' + head + (j.round > 1 ? '（' + j.round + '回目）' : '') + '</div>' +
     '<div class="pno">' + esc(r.pno) + '</div>' +
@@ -493,20 +527,20 @@ function renderResult(j, item) {
     '<div class="count">' + (j.qty > 1 ? j.qty + '個中 ' + j.count + '個' : '数量 1') + '</div>' +
     (skipped.length ? '<div class="skipnote">' + esc(skipText(skipped)) + '（飛ばした工程を済にしました）</div>' : '') +
     '<div class="steps">' + S.processes.map(p =>
-      '<span class="' + (skipped.indexOf(p.code) >= 0 ? 'skip ' : r.done[p.code] ? 'done ' : '') +
+      '<span class="' + (skipped.indexOf(p.code) >= 0 ? 'skip ' : stepDone[p.code] ? 'done ' : '') +
         (p.code === item.proc ? 'cur' : '') + '">' + esc(p.name) + '</span>'
     ).join('') + '</div>' +
     '<div class="sendstate">' + (j.pending ? '送信中…' : '記録しました') + '</div>' +
     '<div class="actions">' +
       (showAll ? '<button class="btn green" id="btnAll">全数完了（残り' + (j.qty - j.count) + '個）</button>' : '') +
       (canUndo ? '<button class="btn orange" id="btnUndo">取り消し</button>' : '') +
-      '<button class="btn red" id="btnRecoat">リコート</button>' +
+      (isFrp(item.proc) ? '' : '<button class="btn red" id="btnRecoat">リコート</button>') +
     '</div>';
   if (showAll) $('btnAll').onclick = () => {
     if (confirm(r.pno + ' の残り' + (j.qty - j.count) + '個を完了にしますか？')) enqueue(r.pno, { all: true });
   };
   if (canUndo) $('btnUndo').onclick = undoLast;
-  $('btnRecoat').onclick = () => openRecoat(r, item.proc);
+  if (!isFrp(item.proc)) $('btnRecoat').onclick = () => openRecoat(r, item.proc);
 }
 
 // ---------- リコート ----------
@@ -515,8 +549,8 @@ const RC = { row: null, proc: '', back: '', reason: '', qty: 1 };
 function openRecoat(r, proc) {
   Object.assign(RC, { row: r, proc: proc, back: '', reason: '', qty: 1 });
   const idx = S.processes.findIndex(p => p.code === proc);
-  // 戻し先は今の工程まで（完了は選べない）
-  const backs = S.processes.slice(0, idx + 1).filter(p => p.code !== 'STOCK');
+  // 戻し先は今の工程まで（完了・FRPは選べない）
+  const backs = S.processes.slice(0, idx + 1).filter(p => p.code !== 'STOCK' && !isFrp(p.code));
   $('rcPno').textContent = r.pno;
   $('rcName').textContent = r.code + '　' + r.name + '（' + procName(proc) + 'でリコート）';
   $('rcBack').innerHTML = backs.map(p => '<button data-v="' + p.code + '">' + esc(p.name) + '</button>').join('');
@@ -555,10 +589,14 @@ function setRecoatMode(on) {
   $('btnMode').textContent = on ? 'リコートモードをやめる' : 'リコートモードにする';
   $('modeBar').classList.toggle('hidden', !on);
 }
-$('btnMode').onclick = () => { sound(); setRecoatMode(!S.recoatMode); };
+$('btnMode').onclick = () => {
+  sound();
+  if (isFrp(S.proc) && !S.recoatMode) { toast('FRPではリコートできません'); return; }
+  setRecoatMode(!S.recoatMode);
+};
 
 function recoatByPno(pno) {
-  const r = S.byPno.get(pno);
+  const r = rowOf(S.proc, pno);
   if (!r) {
     sound('ng');
     toast(pno + ' は一覧にありません（出荷済みか未登録）');
@@ -588,7 +626,7 @@ async function doRecoat() {
     // 先に送ったスキャンの記録が済んでから戻す
     for (let t = 0; S.queue.length && t < 300; t++) await sleep(200);
     const j = await api('recoat', req);
-    const r = S.byPno.get(req.pno);
+    const r = rowOf(req.process, req.pno);
     if (r) { r.done = j.row.done; r.count = j.counts || {}; }
     S.last = { id: j.id, pno: req.pno, proc: req.process, kind: 'recoat' };
     sound('warn');
@@ -619,7 +657,7 @@ async function undoLast() {
   try {
     const j = await api('undo', { id: last.id, rid: uid() });
     S.last = null;
-    const r = S.byPno.get(last.pno);
+    const r = rowOf(last.proc, last.pno);
     if (r && j.row) { r.done = j.row.done; r.count = j.counts || {}; }
     sound('ok');
     const what = last.kind === 'recoat' ? 'リコートを取り消し' : '取り消し';
@@ -714,7 +752,7 @@ function dueKey(s) {
   return y * 10000 + mon * 100 + Number(m[2]);
 }
 function buildDates() {
-  const set = new Set(S.rows.map(r => r.due).filter(d => dueKey(d) !== null));
+  const set = new Set(rowsFor(S.proc).map(r => r.due).filter(d => dueKey(d) !== null));
   S.dates = [...set].sort((a, b) => dueKey(a) - dueKey(b));
   const t = dueKey(S.today);
   const i = S.dates.findIndex(d => dueKey(d) >= t);
@@ -754,7 +792,7 @@ function renderList() {
   $('dateLabel').textContent = S.dates[S.dateIdx] || '--';
 
   const q = $('search').value.trim().toLowerCase();
-  let rows = S.rows;
+  let rows = rowsFor(S.proc);
   if (S.view === 'date') {
     const d = S.dates[S.dateIdx];
     rows = rows.filter(r => r.due === d);
@@ -796,6 +834,7 @@ $('listBody').addEventListener('click', e => {
   $('rmName').textContent = r.code + '　' + r.name;
   $('rmState').textContent = procName(S.proc) + '：' + (done ? '完了済み' : r.qty > 1 ? r.qty + '個中 ' + countOf(r, S.proc) + '個' : '未完了');
   $('rmDone').classList.toggle('hidden', done);
+  $('rmRecoat').classList.toggle('hidden', isFrp(S.proc));
   $('rmDone').textContent = '完了にする' + (r.qty > 1 ? '（残り' + rest + '個すべて）' : '');
   $('rowMenu').classList.remove('hidden');
 });
@@ -817,8 +856,7 @@ $('rmCancel').onclick = () => $('rowMenu').classList.add('hidden');
   if (s && s.token && Date.now() - s.at < IDLE_MS && cached && cached.rows) {
     S.token = s.token; S.user = s.user; S.proc = s.proc || '';
     S.processes = cached.processes; S.today = cached.today; S.reasons = cached.reasons || [];
-    S.rows = cached.rows.map(unpack);
-    S.byPno = new Map(S.rows.map(r => [r.pno, r]));
+    setRows(cached.rows, cached.frpRows);
     showApp();
     refresh(false);
     return;
