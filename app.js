@@ -2,7 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
-const APP_VER = 8;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
+const APP_VER = 9;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -356,18 +356,26 @@ function predict(item) {
     return;
   }
   item.snapshot = { done: Object.assign({}, r.done), count: Object.assign({}, r.count) };
-  if (isDoneFor(r, item.proc)) {
+  if (item.proc === 'MASK' && !needsMask(r)) {
+    item.predicted = 'nomask';
+    sound('warn');
+  } else if (isDoneFor(r, item.proc)) {
     item.predicted = 'already';
     sound('warn');
   } else {
     predictApply(item);
     item.predicted = 'ok';
-    sound(isDoneFor(r, item.proc) ? 'complete' : 'ok');
+    sound(item.missing.length ? 'warn' : isDoneFor(r, item.proc) ? 'complete' : 'ok');
   }
   S.shown = item.rid;
   renderResult({ result: item.predicted, row: r, count: item.predicted === 'already' ? r.qty : countOf(r, item.proc),
-    qty: r.qty, completed: isDoneFor(r, item.proc), skipped: item.skips, pending: true }, item);
+    qty: r.qty, completed: isDoneFor(r, item.proc), skipped: item.skips, missing: item.missing, pending: true }, item);
   markListDirty();
+}
+
+/** マスキングが要る品か：COLORに「+」（2色）がある品だけ。例 070 → 不要、070+KH3 → 必要 */
+function needsMask(r) {
+  return /[+＋]/.test(String(r.color || ''));
 }
 
 /** 予測した結果を手元の一覧に反映する */
@@ -375,10 +383,11 @@ function predictApply(item) {
   const r = rowOf(item.proc, item.pno);
   if (!r || isDoneFor(r, item.proc)) return;
   // FRPは1回読めば完了（数量は数えない）。前の工程が無いのでスキップも無い
+  item.skips = [];
+  item.missing = [];
   if (isFrp(item.proc)) {
     r.count = Object.assign({}, r.count, { FRP: r.qty });
     r.done = Object.assign({}, r.done, { FRP: true });
-    item.skips = [];
     return;
   }
   const next = item.opts.all ? r.qty : Math.min(r.qty, countOf(r, item.proc) + 1);
@@ -387,8 +396,12 @@ function predictApply(item) {
 
   // 飛ばされた前の工程はスキップ扱い（未着手の工程だけ。最終的な判定はサーバーが行う）
   const idx = S.processes.findIndex(p => p.code === item.proc);
+  const maskIdx = S.processes.findIndex(p => p.code === 'MASK');
+  // +ありの品のマスキングは必須なので飛ばさず、済んでいなければ警告する
+  if (needsMask(r) && idx > maskIdx && !isDoneFor(r, 'MASK')) item.missing = ['MASK'];
   item.skips = S.processes.slice(0, idx)
-    .filter(p => p.code !== 'STOCK' && !isFrp(p.code) && !isDoneFor(r, p.code) && countOf(r, p.code) === 0)
+    .filter(p => p.code !== 'STOCK' && !isFrp(p.code) && !(p.code === 'MASK' && needsMask(r)) &&
+      !isDoneFor(r, p.code) && countOf(r, p.code) === 0)
     .map(p => p.code);
   item.skips.forEach(code => {
     r.count = Object.assign({}, r.count, { [code]: r.qty });
@@ -438,10 +451,16 @@ function reconcile(item, j) {
   const changed = j.result !== item.predicted;
   if (j.result === 'ok') {
     if (S.proc === item.proc) S.last = { id: j.id, pno: item.pno, proc: item.proc, qty: j.qty };
-    if (changed) sound(j.completed ? 'complete' : 'ok');
+    const missing = j.missing && j.missing.length;
+    if (changed) sound(missing ? 'warn' : j.completed ? 'complete' : 'ok');
+    else if (missing && !(item.missing && item.missing.length)) sound('warn');
     const skip = skipText(j.skipped);
-    setRecent(item.entry, j.skipped && j.skipped.length ? 'warn' : 'ok',
-      (j.qty > 1 ? j.count + '/' + j.qty + (j.completed ? ' 完了' : '') : '完了') + (skip ? '（' + skip + '）' : ''));
+    setRecent(item.entry, (j.skipped && j.skipped.length) || missing ? 'warn' : 'ok',
+      (j.qty > 1 ? j.count + '/' + j.qty + (j.completed ? ' 完了' : '') : '完了') + (skip ? '（' + skip + '）' : '') +
+      (missing ? '（マスキング未完了）' : ''));
+  } else if (j.result === 'nomask') {
+    if (changed) sound('warn');
+    setRecent(item.entry, 'warn', 'マスキング対象外（+なし）');
   } else if (j.result === 'already') {
     if (changed) sound('warn');
     setRecent(item.entry, 'warn', '完了済み（警告）');
@@ -499,11 +518,12 @@ function showPendingCard(item) {
 function renderResult(j, item) {
   const el = $('result');
   const proc = esc(procName(item.proc));
-  if (j.result === 'shipped' || j.result === 'notfound' || j.result === 'notfrp') {
+  if (j.result === 'shipped' || j.result === 'notfound' || j.result === 'notfrp' || j.result === 'nomask') {
     const msg = {
       shipped: ['出荷済みです', 'DONEシートにあります。'],
       notfound: ['マスターに見つかりません', 'ラベルの読み間違いか、未登録のP.Noです。'],
       notfrp: ['FRPの対象外です', 'FRP実績（2Fシート）にないP.Noです。工程の選び間違いに注意してください。'],
+      nomask: ['マスキングの対象外です', 'COLORに「+」がない品（1色）はマスキング不要です。工程の選び間違いに注意してください。'],
     }[j.result];
     el.className = 'card ' + (j.result === 'notfound' ? 'ng' : 'warn');
     el.innerHTML = '<div class="rhead">' + msg[0] + '</div>' +
@@ -531,6 +551,7 @@ function renderResult(j, item) {
     '<div class="muted">注番 ' + esc(r.cno) + '／色 ' + esc(r.color) + '／出荷 ' + esc(r.due) + '</div>' +
     '<div class="count">' + (j.qty > 1 ? j.qty + '個中 ' + j.count + '個' : '数量 1') + '</div>' +
     (skipped.length ? '<div class="skipnote">' + esc(skipText(skipped)) + '（飛ばした工程を済にしました）</div>' : '') +
+    (j.result === 'ok' && j.missing && j.missing.length ? '<div class="missnote">⚠ マスキングが未完了です（COLORに「+」があるのでマスキングが必要な品）</div>' : '') +
     '<div class="steps">' + S.processes.map(p =>
       '<span class="' + (skipped.indexOf(p.code) >= 0 ? 'skip ' : stepDone[p.code] ? 'done ' : '') +
         (p.code === item.proc ? 'cur' : '') + '">' + esc(p.name) + '</span>'
@@ -757,7 +778,7 @@ function dueKey(s) {
   return y * 10000 + mon * 100 + Number(m[2]);
 }
 function buildDates() {
-  const set = new Set(rowsFor(S.proc).map(r => r.due).filter(d => dueKey(d) !== null));
+  const set = new Set(listRows(S.proc).map(r => r.due).filter(d => dueKey(d) !== null));
   S.dates = [...set].sort((a, b) => dueKey(a) - dueKey(b));
   const t = dueKey(S.today);
   const i = S.dates.findIndex(d => dueKey(d) >= t);
@@ -776,8 +797,15 @@ let searchTimer = null;
 $('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(renderList, 200); });
 $('btnReload').onclick = () => refresh(true);
 
-// 品によって無いことがある工程。次がこの工程で未着手なら「マスキング/研磨」のように次の候補も並べる
-const OPTIONAL = ['MASK', 'ASSY'];
+// 品によって無いことがある工程。次がこの工程で未着手なら「組付/検査」のように次の候補も並べる
+// （マスキングはCOLORの「+」で要・不要が決まるので候補にしない）
+const OPTIONAL = ['ASSY'];
+
+/** その工程の一覧に出す行。マスキングはCOLORに「+」がある品だけ */
+function listRows(proc) {
+  const rows = rowsFor(proc);
+  return proc === 'MASK' ? rows.filter(needsMask) : rows;
+}
 
 /**
  * 製品が今いる工程。済になっている一番後ろの工程（水研〜完了）の次。
@@ -785,7 +813,8 @@ const OPTIONAL = ['MASK', 'ASSY'];
  */
 function locationOf(r) {
   if (isFrp(S.proc)) return { label: 'FRP', order: 0, code: 'FRP' };
-  const back = S.processes.filter(p => !isFrp(p.code)); // 水研〜完了
+  // 水研〜完了。マスキングの要らない品（COLORに+なし）はマスキングを飛ばす
+  const back = S.processes.filter(p => !isFrp(p.code) && !(p.code === 'MASK' && !needsMask(r)));
   let last = -1;
   back.forEach((p, i) => { if (isDoneFor(r, p.code)) last = i; });
   if (last === back.length - 1) return { label: '完了', order: 99, code: '' };
@@ -800,7 +829,7 @@ function locationOf(r) {
   let label = next.name;
   if (OPTIONAL.indexOf(next.code) >= 0 && c === 0 && back[last + 2]) label += '/' + back[last + 2].name;
   if (c > 0) label += ' ' + c + '/' + r.qty;
-  return { label: label, order: last + 1 + 1, code: next.code };
+  return { label: label, order: S.processes.indexOf(next) + 1, code: next.code };
 }
 
 /** 状態の列：選んだ工程が済なら「済」、そうでなければ今いる工程名（選んだ工程にいれば赤で目立たせる） */
@@ -860,7 +889,7 @@ function renderList() {
   $('dateLabel').textContent = S.dates[S.dateIdx] || '--';
 
   const q = $('search').value.trim().toLowerCase();
-  let rows = rowsFor(S.proc);
+  let rows = listRows(S.proc);
   if (S.view === 'date') {
     const d = S.dates[S.dateIdx];
     rows = rows.filter(r => r.due === d);
