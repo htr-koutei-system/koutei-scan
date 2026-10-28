@@ -2,7 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
-const APP_VER = 6;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
+const APP_VER = 7;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -771,11 +771,74 @@ let searchTimer = null;
 $('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(renderList, 200); });
 $('btnReload').onclick = () => refresh(true);
 
+// 品によって無いことがある工程。次がこの工程で未着手なら「マスキング/研磨」のように次の候補も並べる
+const OPTIONAL = ['MASK', 'ASSY'];
+
+/**
+ * 製品が今いる工程。済になっている一番後ろの工程（水研〜完了）の次。
+ * 返り値 { label: 表示, order: 並べ替え用の順番, code: 今いる工程（候補が2つなら先の方） }
+ */
+function locationOf(r) {
+  if (isFrp(S.proc)) return { label: 'FRP', order: 0, code: 'FRP' };
+  const back = S.processes.filter(p => !isFrp(p.code)); // 水研〜完了
+  let last = -1;
+  back.forEach((p, i) => { if (isDoneFor(r, p.code)) last = i; });
+  if (last === back.length - 1) return { label: '完了', order: 99, code: '' };
+  if (last < 0) {
+    // 後半が未着手：FRP品でFRPが済んでいなければFRP、前半（AG列）が済んでいれば水研、それ以外は前工程
+    const f = S.frpByPno && S.frpByPno.get(r.pno);
+    if (f && !f.done.FRP) return { label: 'FRP', order: 0, code: 'FRP' };
+    if (!r.prevDone['W.POLI']) return { label: '前工程', order: -1, code: '' };
+  }
+  const next = back[last + 1];
+  const c = countOf(r, next.code);
+  let label = next.name;
+  if (OPTIONAL.indexOf(next.code) >= 0 && c === 0 && back[last + 2]) label += '/' + back[last + 2].name;
+  if (c > 0) label += ' ' + c + '/' + r.qty;
+  return { label: label, order: last + 1 + 1, code: next.code };
+}
+
+/** 状態の列：選んだ工程が済なら「済」、そうでなければ今いる工程名（選んだ工程にいれば赤で目立たせる） */
 function statusCell(r) {
   if (isDoneFor(r, S.proc)) return '<td class="st done">済</td>';
-  const c = countOf(r, S.proc);
-  if (c > 0) return '<td class="st part">' + c + '/' + r.qty + '</td>';
-  return '<td class="st todo">未</td>';
+  const loc = locationOf(r);
+  const here = loc.code === S.proc || loc.label.split(/[/ ]/).indexOf(procName(S.proc)) >= 0;
+  return '<td class="st ' + (here ? 'todo' : 'where') + '">' + esc(loc.label) + '</td>';
+}
+
+// ---------- 並べ替え（列の見出しをタップ：昇順 → 降順 → 元の順） ----------
+S.sort = { key: '', dir: 1 };
+const SORT_KEYS = {
+  pno: r => r.pno, cno: r => r.cno, code: r => r.code, name: r => r.name, color: r => r.color,
+  qty: r => Number(r.qty) || 0,
+  due: r => dueKey(r.due) ?? 1e9,
+  loc: r => isDoneFor(r, S.proc) ? 1000 : locationOf(r).order,
+};
+function sortRows(rows) {
+  const f = SORT_KEYS[S.sort.key];
+  if (!f) return rows;
+  const dir = S.sort.dir;
+  return rows.map((r, i) => [f(r), i, r]).sort((a, b) => {
+    const x = a[0], y = b[0];
+    const c = typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y), 'ja', { numeric: true });
+    return c ? c * dir : a[1] - b[1]; // 同じ値は元の並びのまま
+  }).map(a => a[2]);
+}
+document.querySelector('#tab-list thead').addEventListener('click', e => {
+  const th = e.target.closest('th[data-sort]');
+  if (!th) return;
+  const k = th.dataset.sort;
+  if (S.sort.key !== k) S.sort = { key: k, dir: 1 };
+  else if (S.sort.dir === 1) S.sort.dir = -1;
+  else S.sort = { key: '', dir: 1 };
+  renderList();
+});
+function renderSortMarks() {
+  document.querySelectorAll('#tab-list th[data-sort]').forEach(th => {
+    const on = th.dataset.sort === S.sort.key;
+    th.classList.toggle('sorted', on);
+    th.querySelector('.mark').textContent = on ? (S.sort.dir === 1 ? '▲' : '▼') : '⇅';
+  });
 }
 
 // 一覧が見えていないときは描き直さず、表示したときにまとめて描く
@@ -802,6 +865,8 @@ function renderList() {
     rows = rows.slice().sort((a, b) => (dueKey(a.due) ?? 1e9) - (dueKey(b.due) ?? 1e9));
   }
   if (q) rows = rows.filter(r => [r.code, r.cno, r.name, r.pno].some(x => String(x).toLowerCase().includes(q)));
+  rows = sortRows(rows);
+  renderSortMarks();
 
   shownRows = rows.slice(0, MAX_ROWS);
   $('listCount').textContent = procName(S.proc) + '：' + rows.length + '件（行をタップすると完了・リコートができます）';

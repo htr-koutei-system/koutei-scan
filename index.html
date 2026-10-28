@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="robots" content="noindex">
 <title>工程進捗入力</title>
-<script src="config.js?v=6"></script>
+<script src="config.js?v=7"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -105,6 +105,11 @@
   td.st.done { color: #16a34a; }
   td.st.todo { color: #dc2626; }
   td.st.part { color: #b45309; }
+  td.st.where { color: #1d4ed8; font-size: 14px; }
+  th[data-sort] { cursor: pointer; user-select: none; -webkit-user-select: none; }
+  th[data-sort] .mark { margin-left: 2px; color: #9ca3af; font-size: 12px; }
+  th.sorted { background: #dbeafe; }
+  th.sorted .mark { color: #1d4ed8; }
   @media (max-width: 700px) { .colSpec, .colCno { display: none; } }
 
   #loading { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center; z-index: 100; color: #fff; font-size: 24px; }
@@ -193,14 +198,14 @@
       </div>
       <table>
         <thead><tr>
-          <th style="width:22%">P.No</th>
-          <th class="colCno" style="width:9%">注番</th>
-          <th style="width:18%">品番</th>
-          <th>品名</th>
-          <th class="colSpec" style="width:12%">色</th>
-          <th style="width:7%">数</th>
-          <th style="width:8%">出荷</th>
-          <th style="width:11%">状態</th>
+          <th style="width:20%" data-sort="pno">P.No<span class="mark"></span></th>
+          <th class="colCno" style="width:9%" data-sort="cno">注番<span class="mark"></span></th>
+          <th style="width:16%" data-sort="code">品番<span class="mark"></span></th>
+          <th data-sort="name">品名<span class="mark"></span></th>
+          <th class="colSpec" style="width:10%" data-sort="color">色<span class="mark"></span></th>
+          <th style="width:7%" data-sort="qty">数<span class="mark"></span></th>
+          <th style="width:9%" data-sort="due">出荷<span class="mark"></span></th>
+          <th style="width:14%" data-sort="loc">状態<span class="mark"></span></th>
         </tr></thead>
         <tbody id="listBody"></tbody>
       </table>
@@ -252,6 +257,6 @@
 <div id="loading" class="hidden">読み込み中…</div>
 <div id="toast" class="hidden"></div>
 
-<script src="app.js?v=6"></script>
+<script src="app.js?v=7"></script>
 </body>
 </html>
