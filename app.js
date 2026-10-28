@@ -2,7 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
-const APP_VER = 7;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
+const APP_VER = 8;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -150,7 +150,12 @@ function unpack(a) {
     prevDone[p.code] = !!((a[9] >> i) & 1);
   });
   return { pno: a[0], cno: a[1], code: a[2], name: a[3], spec: a[4], qty: a[5], color: a[6], due: a[7],
-    done: done, prevDone: prevDone, count: a[10] || {} };
+    done: done, prevDone: prevDone, count: a[10] || {}, brand: a[11] || '', model: a[12] || '' };
+}
+
+/** 一覧の「ブランド/車種」列（K列BRAND / L列MODEL。FRPは2FのJ列 / K列） */
+function brandModel(r) {
+  return [r.brand, r.model].filter(Boolean).join('/');
 }
 
 function applyInit(j) {
@@ -809,7 +814,7 @@ function statusCell(r) {
 // ---------- 並べ替え（列の見出しをタップ：昇順 → 降順 → 元の順） ----------
 S.sort = { key: '', dir: 1 };
 const SORT_KEYS = {
-  pno: r => r.pno, cno: r => r.cno, code: r => r.code, name: r => r.name, color: r => r.color,
+  pno: r => r.pno, brand: brandModel, name: r => r.name, color: r => r.color,
   qty: r => Number(r.qty) || 0,
   due: r => dueKey(r.due) ?? 1e9,
   loc: r => isDoneFor(r, S.proc) ? 1000 : locationOf(r).order,
@@ -864,7 +869,7 @@ function renderList() {
     if (S.view === 'here') rows = rows.filter(r => r.prevDone[S.proc]);
     rows = rows.slice().sort((a, b) => (dueKey(a.due) ?? 1e9) - (dueKey(b.due) ?? 1e9));
   }
-  if (q) rows = rows.filter(r => [r.code, r.cno, r.name, r.pno].some(x => String(x).toLowerCase().includes(q)));
+  if (q) rows = rows.filter(r => [r.code, r.cno, r.name, r.pno, r.brand, r.model].some(x => String(x).toLowerCase().includes(q)));
   rows = sortRows(rows);
   renderSortMarks();
 
@@ -873,15 +878,14 @@ function renderList() {
   $('listBody').innerHTML = shownRows.map((r, i) =>
     '<tr data-i="' + i + '">' +
     '<td>' + esc(r.pno) + '</td>' +
-    '<td class="colCno">' + esc(r.cno) + '</td>' +
-    '<td>' + esc(r.code) + '</td>' +
+    '<td>' + esc(brandModel(r)) + '</td>' +
     '<td>' + esc(r.name) + (r.spec ? '<div class="muted">' + esc(r.spec) + '</div>' : '') + '</td>' +
     '<td class="colSpec">' + esc(r.color) + '</td>' +
     '<td>' + r.qty + '</td>' +
     '<td>' + esc(r.due) + '</td>' +
     statusCell(r) +
     '</tr>'
-  ).join('') + (rows.length > MAX_ROWS ? '<tr><td colspan="8" class="muted">先頭' + MAX_ROWS + '件を表示中。検索で絞り込んでください。</td></tr>' : '');
+  ).join('') + (rows.length > MAX_ROWS ? '<tr><td colspan="7" class="muted">先頭' + MAX_ROWS + '件を表示中。検索で絞り込んでください。</td></tr>' : '');
 }
 
 // ラベルが剥がれたときなどの手動入力

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="robots" content="noindex">
 <title>工程進捗入力</title>
-<script src="config.js?v=7"></script>
+<script src="config.js?v=8"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -192,15 +192,14 @@
           <button class="btn gray" id="dateNext">▶</button>
         </div>
         <div class="row" style="margin-top:10px">
-          <input type="text" id="search" placeholder="品番・注番・品名・P.Noで検索">
+          <input type="text" id="search" placeholder="P.No・ブランド・車種・品名・品番・注番で検索">
         </div>
         <div class="muted" id="listCount" style="margin-top:6px"></div>
       </div>
       <table>
         <thead><tr>
           <th style="width:20%" data-sort="pno">P.No<span class="mark"></span></th>
-          <th class="colCno" style="width:9%" data-sort="cno">注番<span class="mark"></span></th>
-          <th style="width:16%" data-sort="code">品番<span class="mark"></span></th>
+          <th style="width:24%" data-sort="brand">ブランド/車種<span class="mark"></span></th>
           <th data-sort="name">品名<span class="mark"></span></th>
           <th class="colSpec" style="width:10%" data-sort="color">色<span class="mark"></span></th>
           <th style="width:7%" data-sort="qty">数<span class="mark"></span></th>
@@ -257,6 +256,6 @@
 <div id="loading" class="hidden">読み込み中…</div>
 <div id="toast" class="hidden"></div>
 
-<script src="app.js?v=7"></script>
+<script src="app.js?v=8"></script>
 </body>
 </html>
