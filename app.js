@@ -2,7 +2,7 @@
 // GASの1往復は1〜2秒かかるため、スキャン結果は手元の一覧データで即表示し、送信は裏で順番に行う。
 
 const API_URL = window.APP_CONFIG.API_URL;
-const APP_VER = 9;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
+const APP_VER = 10;                // 画面の版。サーバーの MIN_CLIENT_VER 以上にする。上げたら index.html の ?v= も変える
 const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウト
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
@@ -62,7 +62,14 @@ async function api(action, data) {
     if (j.stale) {
       let tried = false;
       try { tried = sessionStorage.getItem('koutei_reload') === '1'; sessionStorage.setItem('koutei_reload', '1'); } catch (e) {}
-      if (!tried) location.reload();
+      if (!tried) {
+        // 送信待ちはサーバーに断られて記録されていない。読み込み直す前に、読み直すP.Noを知らせる
+        if (S.queue.length) {
+          alert('アプリが更新されました。次の' + S.queue.length + '件は記録されていないので、画面が切り替わったら読み直してください。\n\n' +
+            S.queue.map(q => procName(q.proc) + '　' + q.pno).join('\n'));
+        }
+        location.reload();
+      }
     }
     const err = new Error(j.error);
     err.auth = j.auth;
@@ -293,6 +300,7 @@ async function refresh(manual) {
 function procName(code) { const p = S.processes.find(x => x.code === code); return p ? p.name : code; }
 
 function renderProcs() {
+  $('curProc').textContent = '工程：' + procName(S.proc);
   const allowed = allowedProcs();
   if ((FIXED && S.proc === FIXED) || allowed.length === 1) {
     $('procArea').innerHTML = '<div class="fixed">工程：' + esc(procName(S.proc)) + '</div>';
@@ -320,6 +328,30 @@ $('procArea').addEventListener('click', e => {
 });
 
 function listVisible() { return !$('tab-list').classList.contains('hidden'); }
+function isPhone() { return window.innerWidth <= 760; }
+
+// ---------- 画面上部を隠す（スマホで読み取り結果を見やすくする）----------
+// 工程のボタンを隠し、今の工程名だけを上に出す。端末ごとに覚えておく
+function setFolded(on) {
+  document.querySelector('header').classList.toggle('folded', on);
+  $('btnFold').textContent = on ? '▼ 工程' : '▲ 工程';
+  lsSet('koutei_fold', on);
+}
+$('btnFold').onclick = () => setFolded(!document.querySelector('header').classList.contains('folded'));
+setFolded(lsGet('koutei_fold') === true);
+
+// スマホ用：カメラのすぐ下に最新の結果を1行で出す。結果カードが変わるたびに、その見出しとP.Noを写す
+new MutationObserver(() => {
+  const res = $('result');
+  const head = res.querySelector('.rhead');
+  if (!head) return;
+  const pno = res.querySelector('.pno');
+  const extra = res.querySelector('.missnote, .skipnote, .count');
+  const mini = $('mini');
+  mini.className = 'mini ' + ['ok', 'complete', 'warn', 'ng'].filter(c => res.classList.contains(c)).join(' ');
+  mini.innerHTML = esc(head.textContent) +
+    '<span class="sub">' + esc(pno ? pno.textContent : '') + (extra ? '　' + esc(extra.textContent) : '') + '</span>';
+}).observe($('result'), { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
 
 // タブを切り替えてもカメラは止めない（再起動に時間がかかるため）。一覧表示中は読み取りを無視する
 document.querySelector('.tabs').addEventListener('click', e => {
@@ -735,11 +767,18 @@ async function startCamera() {
     cam = new Html5Qrcode('reader', { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE], verbose: false });
     await cam.start(
       { facingMode: 'environment' },
-      { fps: 10, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.7); return { width: s, height: s }; } },
+      // スマホでは映像を横長（4:3）にして高さを抑え、すぐ下の読み取り結果が画面に入るようにする
+      Object.assign({ fps: 10, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.7); return { width: s, height: s }; } },
+        isPhone() ? { aspectRatio: 4 / 3 } : {}),
       onDecode,
       () => {}
     );
     $('camMsg').textContent = 'QRコードを枠に入れてください';
+    // スマホではカメラが画面の上に来るまでスクロールする（上部の見出しの下にぴったり付ける）
+    if (isPhone()) {
+      const top = $('reader').getBoundingClientRect().top + window.scrollY - document.querySelector('header').offsetHeight - 8;
+      window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+    }
     $('btnCamera').classList.add('hidden');
     $('btnStop').classList.remove('hidden');
   } catch (e) {

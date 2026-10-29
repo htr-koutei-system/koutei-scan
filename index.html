@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="robots" content="noindex">
 <title>工程進捗入力</title>
-<script src="config.js?v=9"></script>
+<script src="config.js?v=10"></script>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -47,6 +47,37 @@
   .btn.orange { background: #ea580c; }
   .btn:disabled { opacity: .5; }
   .muted { color: #6b7280; font-size: 15px; }
+
+  .whobtns { display: flex; gap: 6px; flex: none; }
+  .curproc { display: none; font-weight: bold; color: #f59e0b; margin: 0 8px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 工程のボタンを隠した状態：今の工程名だけ上に出す */
+  header.folded #procArea { display: none; }
+  header.folded .curproc { display: block; }
+
+  /* スマホ幅：上部を低くし、工程のボタンは1列で横にスライド */
+  @media (max-width: 760px) {
+    header { padding: 6px 8px; }
+    .who { font-size: 14px; margin-bottom: 4px; }
+    .who button { min-height: 34px; padding: 0 10px; font-size: 14px; }
+    #whoName { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    header.folded #whoName { display: none; } /* 隠したときは名前より今の工程を見せる */
+    header.folded .curproc { margin-left: 0; font-size: 18px; }
+    .procs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; }
+    .procs::-webkit-scrollbar { display: none; }
+    .procs button { flex: 0 0 auto; min-width: 76px; min-height: 46px; font-size: 16px; padding: 0 12px; white-space: nowrap; }
+    .fixed { font-size: 18px; }
+    .tabs { margin-top: 6px; }
+    .tabs button { min-height: 40px; font-size: 16px; }
+    main { padding: 8px; }
+  }
+  @media (min-width: 761px) { #mini { display: none !important; } }
+
+  .mini { margin-top: 8px; padding: 10px 12px; border-radius: 8px; border-left: 10px solid #9ca3af; background: #f9fafb; font-weight: bold; font-size: 17px; line-height: 1.4; }
+  .mini.ok { border-color: #16a34a; background: #f0fdf4; }
+  .mini.complete { border-color: #2563eb; background: #eff6ff; }
+  .mini.warn { border-color: #f59e0b; background: #fffbeb; }
+  .mini.ng { border-color: #dc2626; background: #fef2f2; }
+  .mini .sub { display: block; font-weight: normal; font-size: 15px; color: #374151; word-break: break-all; }
 
   .scanwrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
   @media (max-width: 760px) { .scanwrap { grid-template-columns: 1fr; } }
@@ -137,7 +168,14 @@
 <!-- 本体 -->
 <section id="app" class="hidden">
   <header>
-    <div class="who"><span id="whoName"></span><button id="btnLogout">ログアウト</button></div>
+    <div class="who">
+      <span id="whoName"></span>
+      <span class="curproc" id="curProc"></span>
+      <span class="whobtns">
+        <button id="btnFold" title="工程のボタンを隠す／表示">▲ 工程</button>
+        <button id="btnLogout">ログアウト</button>
+      </span>
+    </div>
     <div id="procArea"></div>
     <div class="tabs">
       <button data-tab="scan" class="on">スキャン</button>
@@ -159,6 +197,8 @@
               <span class="pending hidden" id="pending"></span>
             </div>
             <div id="reader" style="margin-top:8px"></div>
+            <!-- スマホ用：カメラのすぐ下に最新の読み取り結果を1行で出す（下の結果カードと同じ内容） -->
+            <div id="mini" class="mini hidden"></div>
             <div class="row" style="margin-top:10px">
               <input type="text" id="pnoInput" placeholder="P.No（スキャナー・手入力）" autocomplete="off" autocapitalize="characters">
               <button class="btn" id="btnEnter">入力</button>
@@ -257,6 +297,6 @@
 <div id="loading" class="hidden">読み込み中…</div>
 <div id="toast" class="hidden"></div>
 
-<script src="app.js?v=9"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>
