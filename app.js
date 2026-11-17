@@ -29,6 +29,87 @@ function touch() {
   if (S.token) lsSet('koutei', { token: S.token, user: S.user, proc: S.proc, at: Date.now() });
 }
 
+// ---------- 計測（ログインが遅い件の調査用。改善が済んだら外してよい） ----------
+// ページ表示〜ログイン〜一覧表示の各区切りを測り、console に出して端末にも残し、サーバーの実行ログへも送る。
+// URL に ?perf を付けると画面の左下に結果を出す（例 index.html?perf または ?process=PAINT&perf）
+const PERF_SHOW = new URLSearchParams(location.search).has('perf');
+const PERF = { rec: null, bootAt: 0, lastApi: null };
+const pnow = () => Math.round(performance.now());
+
+/** ページの読み込み（HTML・スクリプト）にかかった時間。ページを開いた瞬間からのミリ秒 */
+function perfPage() {
+  const nav = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+  const res = {};
+  (performance.getEntriesByType ? performance.getEntriesByType('resource') : []).forEach(e => {
+    const m = /(html5-qrcode|config\.js|app\.js)/.exec(e.name);
+    if (m) res[m[1]] = { start: Math.round(e.startTime), dur: Math.round(e.duration), end: Math.round(e.responseEnd) };
+  });
+  return {
+    htmlEnd: nav ? Math.round(nav.responseEnd) : null,           // HTML を受け取り終えた
+    domReady: nav ? Math.round(nav.domContentLoadedEventEnd) : null,
+    load: nav ? Math.round(nav.loadEventEnd) : null,
+    navType: nav ? nav.type : '',                                 // navigate / reload / back_forward
+    res: res,
+    bootAt: PERF.bootAt,                                          // app.js が画面（ログイン or 本体）を出した
+  };
+}
+
+function perfBegin(kind) {
+  PERF.rec = { kind: kind, at: new Date().toISOString(), t0: performance.now(), startAt: pnow(), marks: {},
+    ua: navigator.userAgent.slice(0, 120), net: (navigator.connection && navigator.connection.effectiveType) || '' };
+}
+function perfMark(name) {
+  if (PERF.rec) PERF.rec.marks[name] = Math.round(performance.now() - PERF.rec.t0);
+}
+/** api() の最後の1回の内訳を今の記録に入れる */
+function perfTakeApi() {
+  if (PERF.rec && PERF.lastApi) PERF.rec.api = PERF.lastApi;
+}
+/** 画面が描かれるのを待って締める。ログ・端末保存・サーバーへの送信・（?perf なら）画面表示 */
+function perfEnd() {
+  const rec = PERF.rec;
+  if (!rec) return;
+  PERF.rec = null;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    rec.marks.painted = Math.round(performance.now() - rec.t0);
+    delete rec.t0;
+    rec.page = perfPage();
+    console.log('[perf] ' + perfSummary(rec), rec);
+    const list = lsGet('koutei_perf') || [];
+    list.unshift(rec);
+    lsSet('koutei_perf', list.slice(0, 10));
+    if (PERF_SHOW) perfShow(rec);
+    // 計測結果をサーバーの実行ログへ（失敗しても何もしない。画面の動きには関係させない）
+    if (S.token) {
+      fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: 'perf', token: S.token, ver: APP_VER, data: rec }) }).catch(() => {});
+    }
+  }));
+}
+function perfSummary(rec) {
+  const a = rec.api || {};
+  const sv = a.server || {};
+  const laps = (sv.laps || []).map(l => l.n + ' ' + l.ms).join(', ');
+  return rec.kind + '：合計 ' + rec.marks.painted + 'ms' +
+    '（通信 ' + a.headers + ' ／受信 ' + a.body + ' ／解析 ' + a.parse + ' ／サーバー内 ' + sv.total + ' ／' +
+    Math.round((a.bytes || 0) / 1024) + 'KB）' +
+    ' 画面: ' + Object.keys(rec.marks).map(k => k + ' ' + rec.marks[k]).join(', ') +
+    ' ／サーバー内訳: ' + laps;
+}
+function perfShow(rec) {
+  let el = $('perfBox');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'perfBox';
+    el.style.cssText = 'position:fixed;left:4px;bottom:4px;max-width:96vw;z-index:200;background:rgba(0,0,0,.8);color:#0f0;' +
+      'font:12px/1.4 monospace;padding:6px 8px;border-radius:6px;white-space:pre-wrap;word-break:break-all';
+    el.onclick = () => el.remove();
+    document.body.appendChild(el);
+  }
+  const p = rec.page;
+  el.textContent = perfSummary(rec) + '\nページ: HTML ' + p.htmlEnd + ' / DOM ' + p.domReady + ' / 画面 ' + p.bootAt +
+    ' / ' + Object.keys(p.res).map(k => k + ' ' + p.res[k].dur).join(', ') + '\n（タップで閉じる）';
+}
+
 // ---------- 通信 ----------
 function loading(on, msg) {
   S.busy = on;
@@ -41,13 +122,20 @@ async function api(action, data) {
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   let j;
   try {
+    const t0 = performance.now();
     // Content-Type を付けない（text/plain）ことで、GASへのCORSプリフライトを避ける
     const res = await fetch(API_URL, {
       method: 'POST',
       body: JSON.stringify(Object.assign({ action: action, token: S.token, ver: APP_VER }, data || {})),
       signal: ctrl.signal,
     });
-    j = await res.json();
+    const t1 = performance.now();
+    const text = await res.text();
+    const t2 = performance.now();
+    j = JSON.parse(text);
+    // 計測：送信〜応答の見出し（GASの起動・転送・サーバー処理を含む）／本文の受信／JSONの解析
+    PERF.lastApi = { action: action, headers: Math.round(t1 - t0), body: Math.round(t2 - t1),
+      parse: Math.round(performance.now() - t2), bytes: text.length, server: j._perf || null };
   } catch (e) {
     const err = new Error(e.name === 'AbortError' ? '通信がタイムアウトしました' : '通信できません。電波を確認してください');
     err.network = true;
@@ -220,15 +308,21 @@ async function doLogin() {
   if (!L.emp) { L.field = 'emp'; renderLogin(); return; }
   if (!L.pin) { L.field = 'pin'; renderLogin(); return; }
   if (S.busy) return;
+  perfBegin('login');
   loading(true, 'ログイン中…');
   try {
     // ログインと一覧の取得を1往復で行う
     const j = await api('login', { emp: L.emp, pin: L.pin });
+    perfMark('response'); perfTakeApi();
     S.token = j.token;
     applyInit(j);
+    perfMark('applyInit');
     L.emp = ''; L.pin = ''; L.field = 'emp'; renderLogin();
     showApp();
+    perfMark('showApp');
+    perfEnd();
   } catch (e) {
+    PERF.rec = null;
     $('loginErr').textContent = e.message;
     L.pin = ''; L.field = 'pin'; renderLogin();
     sound('ng');
@@ -281,10 +375,13 @@ function showApp() {
 /** 一覧を裏で取り直す。画面は止めない */
 async function refresh(manual) {
   $('listCount').textContent = '最新の状態を読み込み中…';
+  if (!PERF.rec) perfBegin(manual ? 'reload' : 'refresh');
   try {
     const j = await api('init');
+    perfMark('response'); perfTakeApi();
     const cur = S.dates[S.dateIdx];
     applyInit(j);
+    perfMark('applyInit');
     // 送信待ちの分は、取り直したデータにもう一度反映しておく
     S.queue.forEach(predictApply);
     buildDates();
@@ -292,9 +389,12 @@ async function refresh(manual) {
     if (i >= 0) S.dateIdx = i;
     if (manual) toast('最新の状態にしました');
   } catch (e) {
+    PERF.rec = null;
     if (!e.auth) toast('一覧の更新に失敗しました：' + e.message);
   }
   renderList();
+  perfMark('renderList');
+  perfEnd();
 }
 
 function procName(code) { const p = S.processes.find(x => x.code === code); return p ? p.name : code; }
@@ -993,12 +1093,16 @@ $('rmCancel').onclick = () => $('rowMenu').classList.add('hidden');
   if (s && s.token && Date.now() - s.at < IDLE_MS && cached && cached.rows) {
     S.token = s.token; S.user = s.user; S.proc = s.proc || '';
     S.processes = cached.processes; S.today = cached.today; S.reasons = cached.reasons || [];
+    perfBegin('resume');  // ログインが残っていた：端末の一覧ですぐ表示 → 裏で取り直す
     setRows(cached.rows, cached.frpRows);
     showApp();
+    PERF.bootAt = pnow();
+    perfMark('showCached');
     refresh(false);
     return;
   }
   lsDel('koutei');
   S.token = '';
   showLogin();
+  PERF.bootAt = pnow();
 })();
