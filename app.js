@@ -7,6 +7,7 @@ const IDLE_MS = 60 * 60 * 1000;   // 操作がないまま1時間でログアウ
 const SAME_CODE_MS = 2500;        // 同じQRを続けて読んだときの無視時間
 const TIMEOUT_MS = 30000;         // 1回の通信の待ち時間の上限
 const RETRY = 3;                  // 通信エラー時の再送回数
+const CACHED_ROWS_MAX_MS = 24 * 60 * 60 * 1000; // 端末に残った一覧をログイン直後の表示に使う上限（これより古ければ一緒に受け取る）
 const FIXED = (new URLSearchParams(location.search).get('process') || '').toUpperCase();
 
 const S = {
@@ -14,7 +15,14 @@ const S = {
   proc: '', view: 'date', dates: [], dateIdx: 0,
   busy: false, last: null, recent: [],
   queue: [], sending: false, shown: '', listDirty: false,
+  replays: [], // 一覧を取り直し中に受けたサーバーの結果（取り直した後に重ね直す）
 };
+
+/** サーバーが返した行の状態を手元に入れる。一覧を取り直している最中なら、取り直した後にもう一度入れる */
+function applyServer(fn) {
+  fn();
+  S.replays.forEach(list => list.push(fn));
+}
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -308,19 +316,31 @@ async function doLogin() {
   if (!L.emp) { L.field = 'emp'; renderLogin(); return; }
   if (!L.pin) { L.field = 'pin'; renderLogin(); return; }
   if (S.busy) return;
-  perfBegin('login');
+  // 端末に前回の一覧が残っていれば、ログインでは一覧を受け取らず（速い）、残った一覧ですぐ表示して裏で取り直す。
+  // 一覧が無い・古すぎるときは、これまでどおりログインと一覧の取得を1往復で行う
+  const cached = lsGet('koutei_rows');
+  const lite = !!(cached && cached.rows && Date.now() - (cached.at || 0) < CACHED_ROWS_MAX_MS);
+  perfBegin(lite ? 'login-lite' : 'login');
   loading(true, 'ログイン中…');
   try {
-    // ログインと一覧の取得を1往復で行う
-    const j = await api('login', { emp: L.emp, pin: L.pin });
+    const j = await api('login', { emp: L.emp, pin: L.pin, lite: lite });
     perfMark('response'); perfTakeApi();
     S.token = j.token;
-    applyInit(j);
+    const needRefresh = !j.rows; // 古いサーバーは lite を知らず一覧も返すので、そのときは取り直さない
+    if (needRefresh) {
+      S.processes = j.processes; S.today = j.today; S.reasons = j.reasons || []; S.user = j.user;
+      setRows(cached.rows, cached.frpRows);
+      // 担当工程（allowed）は人ごとに違うので、端末の控えも今の人の分にしておく（再読み込みで前の人の工程が出ないように）
+      lsSet('koutei_rows', Object.assign({}, cached, { today: j.today, processes: j.processes, reasons: S.reasons }));
+    } else {
+      applyInit(j);
+    }
     perfMark('applyInit');
     L.emp = ''; L.pin = ''; L.field = 'emp'; renderLogin();
     showApp();
     perfMark('showApp');
     perfEnd();
+    if (needRefresh) refresh(false);
   } catch (e) {
     PERF.rec = null;
     $('loginErr').textContent = e.message;
@@ -376,12 +396,20 @@ function showApp() {
 async function refresh(manual) {
   $('listCount').textContent = '最新の状態を読み込み中…';
   if (!PERF.rec) perfBegin(manual ? 'reload' : 'refresh');
+  const myRec = PERF.rec;
+  // 取り直している間に返ってきたスキャン等の結果を控える。取り直したデータはそれより前の状態のことがあるので、後で重ねる
+  const replay = [];
+  S.replays.push(replay);
+  const token = S.token;
   try {
     const j = await api('init');
+    // 取り直している間にログアウト・別の人がログインした：前の人の一覧で上書きしない
+    if (S.token !== token) { if (PERF.rec === myRec) PERF.rec = null; return; }
     perfMark('response'); perfTakeApi();
     const cur = S.dates[S.dateIdx];
     applyInit(j);
     perfMark('applyInit');
+    replay.forEach(f => f());
     // 送信待ちの分は、取り直したデータにもう一度反映しておく
     S.queue.forEach(predictApply);
     buildDates();
@@ -391,6 +419,8 @@ async function refresh(manual) {
   } catch (e) {
     PERF.rec = null;
     if (!e.auth) toast('一覧の更新に失敗しました：' + e.message);
+  } finally {
+    S.replays = S.replays.filter(x => x !== replay);
   }
   renderList();
   perfMark('renderList');
@@ -578,8 +608,11 @@ function reconcile(item, j) {
   const r = rowOf(item.proc, item.pno);
   // 完了として記録されなかったときは、手元で先に付けた「仮の完了」を元に戻す
   if (j.result !== 'ok' && r && item.snapshot) { r.done = item.snapshot.done; r.count = item.snapshot.count; }
-  if (j.row) mergeRow(j.row, item.proc, j.result === 'ok' ? j.count : null);
-  if (r && j.counts) r.count = j.counts;
+  applyServer(() => {
+    if (j.row) mergeRow(j.row, item.proc, j.result === 'ok' ? j.count : null);
+    const r2 = rowOf(item.proc, item.pno);
+    if (r2 && j.counts) r2.count = j.counts;
+  });
   const changed = j.result !== item.predicted;
   if (j.result === 'ok') {
     if (S.proc === item.proc) S.last = { id: j.id, pno: item.pno, proc: item.proc, qty: j.qty };
@@ -784,8 +817,10 @@ async function doRecoat() {
     // 先に送ったスキャンの記録が済んでから戻す
     for (let t = 0; S.queue.length && t < 300; t++) await sleep(200);
     const j = await api('recoat', req);
-    const r = rowOf(req.process, req.pno);
-    if (r) { r.done = j.row.done; r.count = j.counts || {}; }
+    applyServer(() => {
+      const r = rowOf(req.process, req.pno);
+      if (r) { r.done = j.row.done; r.count = j.counts || {}; }
+    });
     S.last = { id: j.id, pno: req.pno, proc: req.process, kind: 'recoat' };
     sound('warn');
     const text = 'リコート→' + procName(req.back) + '（' + req.reason + (j.qty > 1 ? '・' + j.n + '個' : '') + '）';
@@ -815,8 +850,10 @@ async function undoLast() {
   try {
     const j = await api('undo', { id: last.id, rid: uid() });
     S.last = null;
-    const r = rowOf(last.proc, last.pno);
-    if (r && j.row) { r.done = j.row.done; r.count = j.counts || {}; }
+    applyServer(() => {
+      const r = rowOf(last.proc, last.pno);
+      if (r && j.row) { r.done = j.row.done; r.count = j.counts || {}; }
+    });
     sound('ok');
     const what = last.kind === 'recoat' ? 'リコートを取り消し' : '取り消し';
     addRecent('warn', last.pno, last.proc, what);
